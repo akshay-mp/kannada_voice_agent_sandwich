@@ -1,6 +1,7 @@
 
 import asyncio
 import contextlib
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, List
 from uuid import uuid4
@@ -11,7 +12,9 @@ from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableGenerator
-from langchain_google_genai import ChatGoogleGenerativeAI
+# from langchain_google_genai import ChatGoogleGenerativeAI  # Commented for quota limits
+from langchain_openai import ChatOpenAI
+import os
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.prebuilt import create_react_agent
 from starlette.staticfiles import StaticFiles
@@ -27,15 +30,41 @@ from events import (
     event_to_dict,
 )
 from utils import merge_async_iters
+from logger import logger
+from middleware import RequestLoggerMiddleware
+from memory import init_memory, update_user_profile, get_user_profile
 
 load_dotenv()
 
 STATIC_DIR = Path(__file__).parent.parent / "web" / "dist"
 
 if not STATIC_DIR.exists():
-    print(f"Warning: Static dir {STATIC_DIR} not found.")
+    logger.warning(f"Static dir {STATIC_DIR} not found.")
 
-app = FastAPI()
+
+# Global state
+agent = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global agent
+    # Initialize long-term memory DB (for user preferences)
+    await init_memory()
+    
+    # Use InMemorySaver for short-term session memory (reliable, no external deps)
+    checkpointer = InMemorySaver()
+    
+    # Initialize Agent with memory tools
+    agent = create_react_agent(
+        model=llm,
+        tools=[add_to_order, confirm_order, save_preference, get_preference],
+        prompt=system_prompt,
+        checkpointer=checkpointer,
+    )
+    logger.info("Agent initialized with InMemorySaver + SQLite long-term memory tools.")
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,6 +73,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.add_middleware(RequestLoggerMiddleware)
 
 
 def add_to_order(item: str, quantity: int) -> str:
@@ -56,6 +87,19 @@ def confirm_order(order_summary: str) -> str:
     return f"Order confirmed: {order_summary}. Sending to kitchen."
 
 
+async def save_preference(preference: str) -> str:
+    """Save a user preference (e.g., favorite food, dietary restriction) for future reference."""
+    # Using a default user_id for now since we don't have auth
+    await update_user_profile("default_user", preference)
+    return "Preference saved."
+
+
+async def get_preference() -> str:
+    """Get stored user preferences to personalize recommendations."""
+    prefs = await get_user_profile("default_user")
+    return f"User preferences: {prefs}" if prefs else "No preferences found."
+
+
 system_prompt = """
 You are a helpful sandwich shop assistant. Your goal is to take the user's order.
 Be concise and friendly.
@@ -65,19 +109,20 @@ Available meats: turkey, ham, roast beef.
 Available cheeses: swiss, cheddar, provolone.
 """
 
-# Initialize Gemini Agent
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    temperature=0,
-    streaming=True
-)
+# Initialize Gemini Agent (commented out due to quota limits)
+# llm = ChatGoogleGenerativeAI(
+#     model="gemini-2.5-pro",
+#     temperature=0,
+#     streaming=True
+# )
 
-# Create the agent graph
-agent = create_react_agent(
-    model=llm,
-    tools=[add_to_order, confirm_order],
-    prompt=system_prompt,
-    checkpointer=InMemorySaver(),
+# Initialize OpenAI-compatible LLM via NEBIUS Router
+llm = ChatOpenAI(
+    base_url="https://api.tokenfactory.nebius.com/v1/",
+    api_key=os.environ.get("NEBIUS_API_KEY"),
+    model="Qwen/Qwen3-235B-A22B-Instruct-2507",
+    temperature=0,
+    streaming=True,
 )
 
 
@@ -104,9 +149,9 @@ async def _stt_stream(
     try:
         async for event in stt.receive_events():
             if event.type == "stt_chunk":
-                print(f"[STT] Partial: {event.transcript}")
+                logger.info(f"[STT] Partial: {event.transcript}")
             elif event.type == "stt_output":
-                print(f"[STT] Final: {event.transcript}")
+                logger.info(f"[STT] Final: {event.transcript}")
             yield event
     finally:
         with contextlib.suppress(asyncio.CancelledError):
@@ -129,7 +174,7 @@ async def _agent_stream(
         yield event
 
         if event.type == "stt_output":
-            print(f"[Agent] Processing: {event.transcript}")
+            logger.info(f"[Agent] Processing: {event.transcript}")
             try:
                 stream = agent.astream(
                     {"messages": [HumanMessage(content=event.transcript)]},
@@ -147,18 +192,18 @@ async def _agent_stream(
                                     if isinstance(item, dict) and item.get('type') == 'text':
                                         text = item.get('text', '')
                                         if text:
-                                            print(f"[Agent] Response: {text[:50]}...")
+                                            logger.info(f"[Agent] Response: {text[:50]}...")
                                             yield AgentChunkEvent.create(text)
                                     elif isinstance(item, str) and item:
-                                        print(f"[Agent] Response: {item[:50]}...")
+                                        logger.info(f"[Agent] Response: {item[:50]}...")
                                         yield AgentChunkEvent.create(item)
                             elif isinstance(content, str) and content:
-                                print(f"[Agent] Response: {content[:50]}...")
+                                logger.info(f"[Agent] Response: {content[:50]}...")
                                 yield AgentChunkEvent.create(content)
 
                         if message.tool_calls:
                             for tool_call in message.tool_calls:
-                                print(f"[Agent] Tool call: {tool_call.get('name')}")
+                                logger.info(f"[Agent] Tool call: {tool_call.get('name')}")
                                 yield ToolCallEvent.create(
                                     id=tool_call.get("id", str(uuid4())),
                                     name=tool_call.get("name", "unknown"),
@@ -166,19 +211,17 @@ async def _agent_stream(
                                 )
 
                     elif isinstance(message, ToolMessage):
-                        print(f"[Agent] Tool result received")
+                        logger.info(f"[Agent] Tool result received")
                         yield ToolResultEvent.create(
                             tool_call_id=message.tool_call_id,
                             name=message.name if hasattr(message, "name") else "unknown",
                             result=str(message.content) if message.content else "",
                         )
 
-                print("[Agent] Response complete")
+                logger.info("[Agent] Response complete")
                 yield AgentEndEvent.create()
             except Exception as e:
-                print(f"[Agent] Error: {type(e).__name__}: {e}")
-                import traceback
-                traceback.print_exc()
+                logger.error(f"[Agent] Error: {type(e).__name__}: {e}", exc_info=True)
 
 
 async def _tts_stream(
@@ -197,17 +240,17 @@ async def _tts_stream(
         """Run TTS synthesis and put audio events in queue."""
         tts = ElevenLabsTTS(output_format="pcm_24000")
         try:
-            print(f"[TTS] Synthesizing: {text[:50]}...")
+            logger.info(f"[TTS] Synthesizing: {text[:50]}...")
             await tts.send_text(text)
             await tts.send_text("")  # Signal end of input
             
             async for tts_event in tts.receive_events():
-                print(f"[TTS] Audio chunk")
+                logger.info(f"[TTS] Audio chunk")
                 await tts_queue.put(tts_event)
             
-            print("[TTS] Synthesis complete")
+            logger.info("[TTS] Synthesis complete")
         except Exception as e:
-            print(f"[TTS] Error: {type(e).__name__}: {e}")
+            logger.error(f"[TTS] Error: {type(e).__name__}: {e}")
         finally:
             await tts.close()
 
@@ -247,12 +290,27 @@ async def _tts_stream(
         async for event in merge_async_iters(process_upstream(), drain_tts_queue()):
             yield event
     finally:
-        # Cleanup: cancel any remaining TTS tasks
+        # Wait for all active TTS tasks to finish (don't cancel them prematurely)
+        # This ensures all audio chunks are sent before cleanup
         for task in active_tts_tasks:
             if not task.done():
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+                try:
+                    await asyncio.wait_for(task, timeout=30.0)  # Wait up to 30s for TTS to finish
+                except asyncio.TimeoutError:
+                    logger.warning("[TTS] Task timed out, cancelling")
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+                except asyncio.CancelledError:
+                    pass
+        
+        # Drain any remaining audio chunks from the queue
+        while not tts_queue.empty():
+            try:
+                event = tts_queue.get_nowait()
+                yield event
+            except asyncio.QueueEmpty:
+                break
 
 
 pipeline = (
@@ -265,7 +323,7 @@ pipeline = (
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    print("[WS] Connection opened")
+    logger.info("[WS] Connection opened")
 
     async def websocket_audio_stream() -> AsyncIterator[bytes]:
         """Async generator that yields audio bytes from the websocket."""
@@ -275,10 +333,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 data = await websocket.receive_bytes()
                 packet_count += 1
                 if packet_count % 100 == 0:
-                    print(f"[WS] Received {packet_count} audio chunks")
+                    logger.debug(f"[WS] Received {packet_count} audio chunks")
                 yield data
         except Exception as e:
-            print(f"[WS] Audio stream ended: {e}")
+            logger.info(f"[WS] Audio stream ended: {e}")
 
     output_stream = pipeline.atransform(websocket_audio_stream())
 
@@ -286,9 +344,15 @@ async def websocket_endpoint(websocket: WebSocket):
         async for event in output_stream:
             await websocket.send_json(event_to_dict(event))
     except Exception as e:
-        print(f"[WS] Error: {e}")
+        logger.error(f"[WS] Error: {e}")
     finally:
-        print("[WS] Connection closed")
+        logger.info("[WS] Connection closed")
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "ok", "service": "voice-agent"}
 
 
 if STATIC_DIR.exists():

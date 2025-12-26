@@ -35,6 +35,15 @@ flowchart LR
 2. **Agent Stage** (`_agent_stream`): Invokes **Google Gemini** agent on final transcripts, yields agent responses (`agent_chunk`, `tool_call`, `tool_result`, `agent_end`).
 3. **TTS Stage** (`_tts_stream`): Sends agent text to **ElevenLabs TTS**, yields audio events (`tts_chunk`).
 
+### Additional Features
+
+#### Long-term Memory
+The agent persists user preferences using a local SQLite database (`voice_agent.db`). This allows the agent to remember details like dietary restrictions across sessions.
+
+#### Observability
+- **Request Logging**: `src/middleware.py` provides structured logging for all HTTP requests.
+- **Event Tracing**: All pipeline events are logged for debugging.
+
 ## Prerequisites
 
 - **Python** (3.11+)
@@ -82,6 +91,11 @@ flowchart LR
 │   ├── elevenlabs_stt.py   # ElevenLabs Real-time STT
 │   ├── elevenlabs_tts.py   # ElevenLabs Real-time TTS
 │   ├── events.py           # Event type definitions
+│   ├── memory.py           # SQLite memory manager
+│   ├── logger.py           # Application logger
+│   ├── middleware.py       # API request logging
+│   ├── test_stt.py         # STT unit tests
+│   ├── test_tts.py         # TTS unit tests
 │   └── utils.py
 ├── pyproject.toml       # Project dependencies
 └── uv.lock

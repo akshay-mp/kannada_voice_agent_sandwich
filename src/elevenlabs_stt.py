@@ -20,6 +20,7 @@ from elevenlabs import RealtimeEvents, AudioFormat
 from elevenlabs.realtime import RealtimeAudioOptions, CommitStrategy
 
 from events import STTChunkEvent, STTEvent, STTOutputEvent
+from logger import logger
 
 
 class ElevenLabsSTT:
@@ -67,12 +68,12 @@ class ElevenLabsSTT:
                     })
                 break
             except Exception as e:
-                print(f"[Warning] Failed to send audio chunk (attempt {attempt+1}/{retries+1}): {e}")
+                logger.warning(f"[Warning] Failed to send audio chunk (attempt {attempt+1}/{retries+1}): {e}")
                 # Force reset session on error to trigger reconnect next time
                 self._session = None
                 if attempt == retries:
                     # Don't raise, just log to prevent stream crash on single chunk failure
-                    print("[Error] Could not send audio chunk after retries.")
+                    logger.error("[Error] Could not send audio chunk after retries.")
 
     async def close(self) -> None:
         """Close the WebSocket connection."""
@@ -119,9 +120,9 @@ class ElevenLabsSTT:
         try:
             # Connect using the SDK
             self._session = await self.client.speech_to_text.realtime.connect(options=options)
-            print("[STT] Connected to ElevenLabs")
+            logger.info("[STT] Connected to ElevenLabs")
         except Exception as e:
-            print(f"[STT] Connection failed: {e}")
+            logger.error(f"[STT] Connection failed: {e}")
             self._session = None
             return
 
@@ -129,22 +130,22 @@ class ElevenLabsSTT:
         def on_partial(data):
             text = data.get("text", "")
             if text:
-                print(f"[DEBUG] STT Partial: {text}")
+                logger.debug(f"[DEBUG] STT Partial: {text}")
                 self._event_queue.put_nowait(STTChunkEvent.create(text))
 
         def on_committed(data):
             text = data.get("text", "")
             if text:
-                print(f"[DEBUG] STT Committed: {text}")
+                logger.debug(f"[DEBUG] STT Committed: {text}")
                 self._event_queue.put_nowait(STTOutputEvent.create(text))
         
         def on_error(error):
-            print(f"[STT] Error: {error}")
+            logger.error(f"[STT] Error: {error}")
             self._session = None
             # Do NOT set close_event, allowing reconnect
 
         def on_close():
-            print("[STT] Session closed")
+            logger.info("[STT] Session closed")
             self._session = None
             if getattr(self, "_is_closing", False):
                 self._close_event.set()

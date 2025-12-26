@@ -19,6 +19,7 @@ import websockets
 from websockets.client import WebSocketClientProtocol
 
 from events import TTSChunkEvent
+from logger import logger
 
 
 class ElevenLabsTTS:
@@ -98,16 +99,16 @@ class ElevenLabsTTS:
                                 if audio_chunk:
                                     yield TTSChunkEvent.create(audio_chunk)
                             if message.get("isFinal"):
-                                print("[DEBUG] ElevenLabs: Turn complete (isFinal)")
+                                logger.debug("[DEBUG] ElevenLabs: Turn complete (isFinal)")
                                 break
                             if "error" in message:
-                                print(f"[DEBUG] ElevenLabs error: {message}")
+                                logger.debug(f"[DEBUG] ElevenLabs error: {message}")
                                 break
                         except json.JSONDecodeError as e:
-                            print(f"[DEBUG] ElevenLabs JSON decode error: {e}")
+                            logger.debug(f"[DEBUG] ElevenLabs JSON decode error: {e}")
                             continue
                 except websockets.exceptions.ConnectionClosed:
-                    print("ElevenLabs: WebSocket connection closed")
+                    logger.info("ElevenLabs: WebSocket connection closed")
                 finally:
                     if self._ws and self._ws.close_code is None:
                         await self._ws.close()
